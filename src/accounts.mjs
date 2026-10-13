@@ -49,14 +49,27 @@ export class AccountPool {
     if (!acc.engine.agentId) await acc.engine.ensureAgent(acc.file);
   }
 
-  /** wait for any free account up to timeoutMs (requests queue instead of failing fast).
-   *  Claims (sets busy) atomically inside the sync section — selecting first and marking later
-   *  across an await boundary let two concurrent requests claim the same account. */
+  /** quota circuit-breaker cache (server refreshes every 60s); unknown = usable (fail open) */
+  async refreshUsage() {
+    const u = await this.usage();
+    this.usageMap = Object.fromEntries(u.map(x => [x.email || x.id, x]));
+    this.usageAt = Date.now();
+    return this.usageMap;
+  }
+  usable(a) {
+    const u = (this.usageMap || {})[a.data.email || a.data.id];
+    return !u || u.error || u.hasAvailable !== false;
+  }
+
+  /** wait for any free, quota-available account up to timeoutMs (requests queue instead of
+   *  failing fast). Claims (sets busy) atomically inside the sync section. */
   async acquire(timeoutMs = 120000) {
     const t0 = Date.now();
     for (;;) {
-      const free = this.accounts.filter(a => !a.busy);
+      const idle = this.accounts.filter(a => !a.busy);
+      const free = idle.filter(a => this.usable(a));
       if (free.length) { const acc = free[Math.floor(Math.random() * free.length)]; acc.busy = true; return acc; }
+      if (idle.length && !free.length) throw new Error('all idle accounts have exhausted their weekly Grok Bot quota');
       if (Date.now() - t0 >= timeoutMs) return null;
       await new Promise(r => setTimeout(r, 2000));
     }

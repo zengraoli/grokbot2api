@@ -14,7 +14,16 @@ const PORT = Number(process.argv[2] || process.env.PORT || 3010);
 const API_KEY = process.env.GROKBOT_API_KEY || ''; // set in start.bat to require auth; empty = accept anything
 const FILES_DIR = path.join(ROOT, 'files');
 fs.mkdirSync(FILES_DIR, { recursive: true });
+{ // keep only the newest 200 generated files
+  try {
+    const list = fs.readdirSync(FILES_DIR).map(n => ({ n, m: fs.statSync(path.join(FILES_DIR, n)).mtimeMs })).sort((a, b) => b.m - a.m);
+    for (const f of list.slice(200)) fs.unlinkSync(path.join(FILES_DIR, f));
+    if (list.length > 200) console.log(`[files] cleaned ${list.length - 200} old files (kept 200)`);
+  } catch {}
+}
 const pool = new AccountPool(undefined, { filesDir: FILES_DIR, filesBaseUrl: `http://127.0.0.1:${PORT}` }).load();
+const refreshUsage = () => pool.refreshUsage().catch(() => {});
+refreshUsage(); setInterval(refreshUsage, 60000); // quota circuit-breaker cache
 for (const acc of pool.accounts) { // sweep leftover scratch agents; creation is on-demand (no prewarm: idle scratch agents occupy the account's sandbox slots and block new ones)
   acc.engine.cleanupScratchAgents()
     .then(n => { if (n) console.log(`[pool] cleaned ${n} leftover scratch agents`); })
@@ -139,10 +148,13 @@ const server = http.createServer(async (req, res) => {
       const prompt = clean.map(m => `${m.role === 'assistant' ? '[assistant]' : m.role === 'system' ? '[system]' : '[user]'} ${m.content}`).join('\n\n')
         + `\n\n[system] Reply to the last user message above directly.`;
       let userMsg = [...clean].reverse().find(m => m.role === 'user')?.content || clean[clean.length - 1].content;
-      // image-generation requests: bot shows results on its realtime canvas which never persists —
+      // generation requests: bot shows results on its realtime canvas which never persists —
       // instruct it to also deliver the file as an attachment (our attachment channel saves to files/)
-      if (/画一|画个|画张|生成.{0,8}(图|图片|图像)|draw |generate.{0,12}image/i.test(userMsg) && !/附件|文件发|保存成|save as/i.test(userMsg)) {
+      const noAttachHint = /附件|文件发|保存成|save as/i.test(userMsg);
+      if (/画一|画个|画张|生成.{0,8}(图|图片|图像)|draw |generate.{0,12}image/i.test(userMsg) && !noAttachHint) {
         userMsg += '\n（画完后请把图片文件作为附件发给我）';
+      } else if (/朗读|说一段|配音|读一遍|语音播报|tts/i.test(userMsg) && !noAttachHint) {
+        userMsg += '\n（请用 TTS 生成 mp3 音频文件，完成后把音频文件作为附件发给我，不要生成图片）';
       }
       // task hint: any task wording anywhere in the conversation history (not just the latest turn —
       // follow-ups like "对 补全即可" carry no task words but continue a task) beats the question check
