@@ -1,0 +1,12 @@
+{
+  "name": "grokbot2api",
+  "version": "0.1.0",
+  "description": "Grok Bot (api2.cursor.sh) to OpenAI-compatible API gateway. Pure HTTP, zero dependencies.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "harvest": "node src/harvester.mjs",
+    "start": "node src/server.mjs",
+    "refresh": "node src/refresh-all.mjs"
+  }
+}

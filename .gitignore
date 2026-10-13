@@ -1,0 +1,8 @@
+# credentials (tokens, machine-id) — NEVER commit
+accounts/
+# generated attachment files served via /files
+files/
+# logs & scratch
+*.log
+sailboat-test.html
+node_modules/

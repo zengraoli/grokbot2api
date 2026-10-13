@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grokbot2api</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #0F1B14; color: #D7E4DC; min-height: 100vh; padding: 32px 20px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 26px; }
+  h1 { font-size: 22px; color: #F2F7F3; display: flex; align-items: center; gap: 10px; }
+  h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: #4ADE80; box-shadow: 0 0 8px #4ADE80; }
+  .urlpill { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); padding: 7px 14px; border-radius: 8px; font-family: Consolas, monospace; font-size: 13px; color: #8FA898; cursor: pointer; }
+  .urlpill:hover { color: #B9CCBF; }
+  .card { background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); border-radius: 14px; padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; color: #EDF5EF; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
+  button { background: #1B4330; color: #fff; border: none; padding: 8px 16px; border-radius: 8px; font-size: 13px; cursor: pointer; transition: .15s; }
+  button:hover { background: #24573F; }
+  button:disabled { opacity: .5; cursor: wait; }
+  button.ghost { background: rgba(255,255,255,.08); }
+  .actions { display: flex; gap: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th { text-align: left; color: #6E8878; font-weight: 500; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.1); }
+  td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,.05); color: #B9CCBF; }
+  .ok { color: #4ADE80; } .warn { color: #FBBF24; } .bad { color: #F87171; } .dim { color: #6E8878; }
+  .mono { font-family: Consolas, monospace; font-size: 12.5px; }
+  #chatlog { background: #0B140F; border: 1px solid rgba(255,255,255,.07); border-radius: 10px; padding: 14px; height: 300px; overflow-y: auto; font-size: 14px; margin-bottom: 12px; }
+  .msg { margin-bottom: 10px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .msg .who { font-size: 11px; color: #6E8878; margin-bottom: 2px; }
+  .msg.user { color: #D7E4DC; } .msg.bot { color: #4ADE80; }
+  .chatbar { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; background: #0B140F; border: 1px solid rgba(255,255,255,.12); color: #EDF5EF; padding: 10px 14px; border-radius: 8px; font-size: 14px; outline: none; }
+  input[type=text]:focus { border-color: #1B4330; }
+  pre { background: #0B140F; border: 1px solid rgba(255,255,255,.07); border-radius: 10px; padding: 14px; font-size: 12.5px; color: #8FA898; overflow-x: auto; line-height: 1.6; }
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1B4330; color: #fff; padding: 10px 22px; border-radius: 10px; font-size: 13px; display: none; box-shadow: 0 4px 20px rgba(0,0,0,.4); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="dot"></span>grokbot2api <span class="dim" style="font-size:13px;font-weight:400">Grok Bot → OpenAI API</span></h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="text" id="keyinput" placeholder="API Key（开启了鉴权才需要）" style="width:210px;background:#0B140F;border:1px solid rgba(255,255,255,.12);color:#EDF5EF;padding:7px 12px;border-radius:8px;font-size:12.5px;outline:none">
+      <div class="urlpill" id="baseurl" title="点击复制">复制中…</div>
+    </div>
+  </header>
+
+  <div class="card">
+    <h2>账号池 <span class="dim" style="font-weight:400" id="poolsum"></span>
+      <span class="actions">
+        <button id="btn-harvest" title="解密本机 Grok Bot 登录态并导入新账号">从本机收割账号</button>
+        <button id="btn-refresh" class="ghost">一键刷新全部 Token</button>
+      </span>
+    </h2>
+    <table>
+      <thead><tr><th>账号</th><th>Token 到期</th><th>状态</th><th>请求数</th><th>最近使用</th><th>对话 Agent</th></tr></thead>
+      <tbody id="accrows"><tr><td colspan="6" class="dim">加载中…</td></tr></tbody>
+    </table>
+    <p class="dim" style="font-size:12px;margin-top:10px">添加账号：打开 Grok Bot 客户端 → 设置中添加账号登录 → 点“从本机收割账号”。Token 临期自动续签，无需手动管理。</p>
+  </div>
+
+  <div class="card">
+    <h2>对话测试 <span class="dim" style="font-weight:400">model: grok-bot</span></h2>
+    <div id="chatlog"><div class="msg dim">发送消息测试链路（走 /v1/chat/completions，与外部客户端完全一致）。</div></div>
+    <div class="chatbar">
+      <input type="text" id="chatinput" placeholder="输入消息，回车发送…" autocomplete="off">
+      <button id="btn-send">发送</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>接入方式</h2>
+    <pre>Base URL: <span id="curlbase">…</span>/v1      API Key: 任意（如 sk-none）      模型: grok-bot
+
+curl <span id="curlbase2">…</span>/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{"model":"grok-bot","messages":[{"role":"user","content":"你好"}]}'
+
+# Python (openai SDK)
+from openai import OpenAI
+client = OpenAI(base_url="<span id="curlbase3">…</span>/v1", api_key="sk-none")
+print(client.chat.completions.create(model="grok-bot",
+      messages=[{"role":"user","content":"你好"}]).choices[0].message.content)</pre>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const base = location.origin;
+$('#baseurl').textContent = base + '/v1';
+['curlbase','curlbase2','curlbase3'].forEach(id => $('#' + id).textContent = base);
+$('#baseurl').onclick = () => { navigator.clipboard.writeText(base + '/v1'); toast('已复制 ' + base + '/v1'); };
+
+function toast(t) { const el = $('#toast'); el.textContent = t; el.style.display = 'block'; setTimeout(() => el.style.display = 'none', 2200); }
+const days = (iso) => Math.floor((new Date(iso) - Date.now()) / 864e5);
+const fmt = (ts) => ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '—';
+
+const authHeaders = () => ({ 'content-type': 'application/json', authorization: 'Bearer ' + ($('#keyinput').value.trim() || 'sk-none') });
+$('#keyinput').value = localStorage.getItem('gb2a_key') || '';
+$('#keyinput').oninput = () => localStorage.setItem('gb2a_key', $('#keyinput').value.trim());
+
+async function loadStatus() {
+  try {
+    const st = await (await fetch('/admin/status', { headers: authHeaders() })).json();
+    const rows = st.accounts.map(a => {
+      const d = days(a.exp);
+      const expCls = d > 7 ? 'ok' : d > 2 ? 'warn' : 'bad';
+      return `<tr>
+        <td>${a.email}</td>
+        <td class="${expCls}">${a.exp.replace('T',' ').slice(0,16)}（${d} 天后）</td>
+        <td>${a.busy ? '<span class="warn">忙</span>' : '<span class="ok">空闲</span>'}${a.ok === false ? ' <span class="bad">异常</span>' : ''}</td>
+        <td>${a.requests ?? 0}</td>
+        <td class="dim">${fmt(a.last_used)}</td>
+        <td class="mono dim">${(a.agent || '—').slice(0, 8)}</td>
+      </tr>`;
+    }).join('');
+    $('#accrows').innerHTML = rows || '<tr><td colspan="6" class="bad">无账号：请先在 Grok Bot 客户端登录，再点“从本机收割账号”</td></tr>';
+    $('#poolsum').textContent = `${st.accounts.length} 个账号 · ${st.accounts.filter(a => !a.busy).length} 空闲`;
+  } catch (e) { $('#accrows').innerHTML = `<tr><td colspan="6" class="bad">加载失败：${e.message}</td></tr>`; }
+}
+
+async function post(url, btn, label) {
+  btn.disabled = true; const old = btn.textContent; btn.textContent = label + '…';
+  try { const r = await (await fetch(url, { method: 'POST', headers: authHeaders() })).json(); toast(r.message || JSON.stringify(r).slice(0, 80)); }
+  catch (e) { toast('失败：' + e.message); }
+  btn.disabled = false; btn.textContent = old; loadStatus();
+}
+$('#btn-refresh').onclick = (e) => post('/admin/refresh-all', e.target, '刷新中');
+$('#btn-harvest').onclick = (e) => post('/admin/harvest', e.target, '收割中');
+
+function addMsg(who, text) {
+  const el = document.createElement('div'); el.className = 'msg ' + who;
+  el.innerHTML = `<div class="who">${who === 'user' ? '你' : 'grok-bot'}</div>`;
+  el.appendChild(document.createTextNode(text));
+  $('#chatlog').appendChild(el); $('#chatlog').scrollTop = 1e9;
+}
+async function send() {
+  const text = $('#chatinput').value.trim(); if (!text) return;
+  $('#chatinput').value = ''; addMsg('user', text);
+  const btn = $('#btn-send'); btn.disabled = true;
+  const t0 = performance.now();
+  try {
+    const r = await (await fetch('/v1/chat/completions', { method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ model: 'grok-bot', messages: [{ role: 'user', content: text }] }) })).json();
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    addMsg('bot', r.choices?.[0]?.message?.content ?? '错误：' + JSON.stringify(r.error || r));
+    if (r.grok_meta) addMsg('dim', `—— ${r.grok_meta.account} · ${r.grok_meta.latency_ms}ms（页面计时 ${secs}s）`);
+  } catch (e) { addMsg('bot', '请求失败：' + e.message); }
+  btn.disabled = false; loadStatus();
+}
+$('#btn-send').onclick = send;
+$('#chatinput').onkeydown = (e) => { if (e.key === 'Enter') send(); };
+
+loadStatus(); setInterval(loadStatus, 10000);
+</script>
+</body>
+</html>

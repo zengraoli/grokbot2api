@@ -1,0 +1,99 @@
+// accounts.mjs — account pool: loads accounts/*.json, lazy refresh, round-robin dispatch
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { GrokBotEngine } from './engine.mjs';
+import { refreshAccount, isExpiring } from './refresh.mjs';
+
+const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'accounts');
+
+export class AccountPool {
+  constructor(dir = DIR, engineOpts = {}) {
+    this.dir = dir;
+    this.engineOpts = engineOpts;
+    this.accounts = [];   // { file, data, engine, busy, ok }
+    this.rr = 0;
+  }
+
+  load() {
+    fs.mkdirSync(this.dir, { recursive: true });
+    for (const f of fs.readdirSync(this.dir).filter(f => f.endsWith('.json'))) {
+      const file = path.join(this.dir, f);
+      try {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const prev = this.accounts.find(a => a.file === file); // keep stats across reloads
+        this.accounts.push({ file, data, engine: new GrokBotEngine(data, undefined, this.engineOpts), busy: false, ok: null,
+          requests: prev?.requests || 0, last_used: prev?.last_used || null });
+        console.log(`[pool] loaded ${data.email || data.id} (exp ${data.access_exp})`);
+      } catch (e) { console.warn(`[pool] skip ${f}: ${e.message}`); }
+    }
+    if (!this.accounts.length) throw new Error(`no accounts in ${this.dir} — run: node src/harvester.mjs`);
+    return this;
+  }
+
+  /** reload account files (after harvest) while keeping stats of existing ones */
+  reload() {
+    const removed = this.accounts.length;
+    this.accounts = [];
+    this.load();
+    return { added: this.accounts.length, message: `pool reloaded: ${this.accounts.length} account(s)` };
+  }
+
+  /** ensure access token valid; refresh (and persist) when near expiry; auto-discover chat agent */
+  async ensureAuth(acc) {
+    if (isExpiring(acc.data)) {
+      console.log(`[pool] refreshing ${acc.data.email || acc.data.id}...`);
+      await refreshAccount(acc.data, acc.file);
+      acc.engine.account = acc.data;
+    }
+    if (!acc.engine.agentId) await acc.engine.ensureAgent(acc.file);
+  }
+
+  /** wait for any free account up to timeoutMs (requests queue instead of failing fast) */
+  async acquire(timeoutMs = 120000) {
+    const t0 = Date.now();
+    for (;;) {
+      const free = this.accounts.filter(a => !a.busy);
+      if (free.length) return free[Math.floor(Math.random() * free.length)]; // random pick is fine: any free account works
+      if (Date.now() - t0 >= timeoutMs) return null;
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+
+  /** pick next free account (queues while all busy), mark busy for the duration of fn */
+  async withAccount(fn) {
+    const acc = await this.acquire();
+    if (!acc) throw new Error('all accounts busy (waited 120s)');
+    acc.busy = true;
+    try {
+      await this.ensureAuth(acc);
+      const out = await fn(acc);
+      acc.ok = true; acc.requests++; acc.last_used = new Date().toISOString();
+      return out;
+    } catch (e) { acc.ok = false; throw e; }
+    finally { acc.busy = false; }
+  }
+
+  /** run fn with a scratch (fresh) agent: create on demand, delete after.
+   *  No prewarm pool: idle scratch agents occupy the account's limited sandbox slots
+   *  (~2-3 concurrent) and block creation of new ones (send/agent-unavailable). */
+  async withScratch(fn) {
+    const acc = await this.acquire();
+    if (!acc) throw new Error('all accounts busy (waited 120s)');
+    acc.busy = true;
+    let scratch;
+    try {
+      await this.ensureAuth(acc);
+      scratch = await acc.engine.createAgent('gb2a-' + Date.now().toString(36));
+      return await fn(acc, scratch);
+    } finally {
+      acc.busy = false;
+      if (scratch) acc.engine.deleteAgent(scratch.numericId).catch(() => {});
+    }
+  }
+
+  status() {
+    return this.accounts.map(a => ({ email: a.data.email || a.data.id, exp: a.data.access_exp, busy: a.busy,
+      ok: a.ok, requests: a.requests, last_used: a.last_used, agent: a.engine.agentId || a.data.agent_id || a.data.session_id || null }));
+  }
+}
