@@ -55,6 +55,9 @@ const server = http.createServer(async (req, res) => {
     if (url === '/admin/status' && req.method === 'GET') {
       return json(res, 200, { accounts: pool.status() });
     }
+    if (url === '/admin/usage' && req.method === 'GET') {
+      return json(res, 200, { usage: await pool.usage() });
+    }
     if (url === '/admin/refresh-all' && req.method === 'POST') {
       let n = 0; const errs = [];
       for (const acc of pool.accounts) {
@@ -174,15 +177,21 @@ const server = http.createServer(async (req, res) => {
       } : undefined;
 
       let usedEmail = null; // the account that actually served this request (for grok_meta)
+      const pickAccount = req.headers['x-grok-account']; // optional: pin this request to a specific account (email substring)
+      const freshRun = async (acc, scratch) => {
+        usedEmail = acc.data.email || acc.data.id;
+        const saved = acc.engine.agentId;
+        acc.engine.agentId = scratch.legacyAgentId;
+        try { return await acc.engine.chat(userMsg, { timeoutMs: 300000, pollMs: 3000, onEntry, images, taskHint }); }
+        finally { acc.engine.agentId = saved; acc.engine.deleteAgent(scratch.numericId).catch(() => {}); }
+      };
       const reply = fresh
-        ? await pool.withScratch(async (acc, scratch) => {
-            usedEmail = acc.data.email || acc.data.id;
-            const saved = acc.engine.agentId;
-            acc.engine.agentId = scratch.legacyAgentId;
-            try { return await acc.engine.chat(userMsg, { timeoutMs: 300000, pollMs: 3000, onEntry, images, taskHint }); }
-            finally { acc.engine.agentId = saved; }
-          })
-        : await pool.withAccount(acc => { usedEmail = acc.data.email || acc.data.id; return acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images, taskHint }); });
+        ? (pickAccount
+            ? await pool.withAccountByEmail(pickAccount, async (acc) => freshRun(acc, await acc.engine.createAgent('gb2a-' + Date.now().toString(36))))
+            : await pool.withScratch(freshRun))
+        : (pickAccount
+            ? await pool.withAccountByEmail(pickAccount, (acc) => { usedEmail = acc.data.email || acc.data.id; return acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images, taskHint }); })
+            : await pool.withAccount(acc => { usedEmail = acc.data.email || acc.data.id; return acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images, taskHint }); }));
       stopHeartbeat();
 
       if (stream) {

@@ -312,4 +312,19 @@ export class GrokBotEngine {
     const r = await fetch(`${this.backend}/aiserver.v1.GrokBotService/ListGrokBotAgents`, { method: 'POST', headers: { ...this.headers(), 'content-type': 'application/json' }, body: '{}' });
     return r.status === 200;
   }
+
+  /** Grok Bot weekly quota: { usagePercent, nextResetUtc, hasAvailable } */
+  async getUsage() {
+    const crypto = await import('node:crypto');
+    const r = await fetch(`${this.backend}/aiserver.v1.DashboardService/GetSandUsageStatus`, {
+      method: 'POST', headers: { ...this.headers(), 'content-type': 'application/json', 'accept-encoding': 'identity', 'x-request-id': crypto.randomUUID() }, body: '{}',
+    });
+    if (r.status !== 200) throw new Error(`GetSandUsageStatus -> ${r.status}`);
+    const j = await r.json();
+    return {
+      usagePercent: Number(j.usagePercent ?? 0),
+      nextResetUtc: j.nextResetTimestampUtc || null,
+      hasAvailable: j.hasAvailableUsage !== false,
+    };
+  }
 }

@@ -92,6 +92,27 @@ export class AccountPool {
     }
   }
 
+  /** pick a specific account by email (substring match); claims busy like acquire */
+  async withAccountByEmail(email, fn) {
+    const want = String(email || '').toLowerCase();
+    const t0 = Date.now();
+    for (;;) {
+      const acc = this.accounts.find(x => !x.busy && String(x.data.email || x.data.id).toLowerCase().includes(want));
+      if (acc) { acc.busy = true; try { await this.ensureAuth(acc); const out = await fn(acc); acc.ok = true; acc.requests++; acc.last_used = new Date().toISOString(); return out; } catch (e) { acc.ok = false; throw e; } finally { acc.busy = false; } }
+      if (Date.now() - t0 >= 120000) throw new Error(`account matching "${email}" is busy or not found (waited 120s)`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+
+  /** per-account weekly quota snapshot */
+  async usage() {
+    return Promise.all(this.accounts.map(async a => {
+      const base = { email: a.data.email || a.data.id };
+      try { return { ...base, ...(await a.engine.getUsage()) }; }
+      catch (e) { return { ...base, error: e.message }; }
+    }));
+  }
+
   status() {
     return this.accounts.map(a => ({ email: a.data.email || a.data.id, exp: a.data.access_exp, busy: a.busy,
       ok: a.ok, requests: a.requests, last_used: a.last_used, agent: a.engine.agentId || a.data.agent_id || a.data.session_id || null }));
