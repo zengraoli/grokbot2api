@@ -49,12 +49,14 @@ export class AccountPool {
     if (!acc.engine.agentId) await acc.engine.ensureAgent(acc.file);
   }
 
-  /** wait for any free account up to timeoutMs (requests queue instead of failing fast) */
+  /** wait for any free account up to timeoutMs (requests queue instead of failing fast).
+   *  Claims (sets busy) atomically inside the sync section — selecting first and marking later
+   *  across an await boundary let two concurrent requests claim the same account. */
   async acquire(timeoutMs = 120000) {
     const t0 = Date.now();
     for (;;) {
       const free = this.accounts.filter(a => !a.busy);
-      if (free.length) return free[Math.floor(Math.random() * free.length)]; // random pick is fine: any free account works
+      if (free.length) { const acc = free[Math.floor(Math.random() * free.length)]; acc.busy = true; return acc; }
       if (Date.now() - t0 >= timeoutMs) return null;
       await new Promise(r => setTimeout(r, 2000));
     }
@@ -62,9 +64,8 @@ export class AccountPool {
 
   /** pick next free account (queues while all busy), mark busy for the duration of fn */
   async withAccount(fn) {
-    const acc = await this.acquire();
+    const acc = await this.acquire(); // claims busy itself
     if (!acc) throw new Error('all accounts busy (waited 120s)');
-    acc.busy = true;
     try {
       await this.ensureAuth(acc);
       const out = await fn(acc);
@@ -78,9 +79,8 @@ export class AccountPool {
    *  No prewarm pool: idle scratch agents occupy the account's limited sandbox slots
    *  (~2-3 concurrent) and block creation of new ones (send/agent-unavailable). */
   async withScratch(fn) {
-    const acc = await this.acquire();
+    const acc = await this.acquire(); // claims busy itself
     if (!acc) throw new Error('all accounts busy (waited 120s)');
-    acc.busy = true;
     let scratch;
     try {
       await this.ensureAuth(acc);

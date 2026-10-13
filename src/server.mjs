@@ -30,7 +30,7 @@ const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   try {
     if (url === '/' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); // panel edits must show on plain refresh
       return res.end(fs.readFileSync(INDEX));
     }
     if (!authorized(req) && (url.startsWith('/v1/') || url.startsWith('/admin/'))) {
@@ -173,14 +173,16 @@ const server = http.createServer(async (req, res) => {
         if (m.type === 'text' && m.content) sendChunk({ content: m.content + '\n\n' });
       } : undefined;
 
+      let usedEmail = null; // the account that actually served this request (for grok_meta)
       const reply = fresh
         ? await pool.withScratch(async (acc, scratch) => {
+            usedEmail = acc.data.email || acc.data.id;
             const saved = acc.engine.agentId;
             acc.engine.agentId = scratch.legacyAgentId;
             try { return await acc.engine.chat(userMsg, { timeoutMs: 300000, pollMs: 3000, onEntry, images, taskHint }); }
             finally { acc.engine.agentId = saved; }
           })
-        : await pool.withAccount(acc => acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images, taskHint }));
+        : await pool.withAccount(acc => { usedEmail = acc.data.email || acc.data.id; return acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images, taskHint }); });
       stopHeartbeat();
 
       if (stream) {
@@ -191,7 +193,7 @@ const server = http.createServer(async (req, res) => {
         id, object: 'chat.completion', created: Math.floor(t0 / 1000), model: MODEL,
         choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
         usage: { prompt_tokens: Math.ceil(prompt.length / 4), completion_tokens: Math.ceil(reply.length / 4), total_tokens: Math.ceil((prompt.length + reply.length) / 4) },
-        grok_meta: { account: pool.status()[0]?.email, latency_ms: Date.now() - t0 },
+        grok_meta: { account: usedEmail, latency_ms: Date.now() - t0 },
       });
     }
     json(res, 404, { error: { message: 'not found. try GET /v1/models, POST /v1/chat/completions, GET /admin/status' } });
