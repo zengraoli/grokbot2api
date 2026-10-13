@@ -25,10 +25,13 @@ export class GrokBotEngine {
     const fs = await import('node:fs');
     const path = await import('node:path');
     fs.mkdirSync(this.filesDir, { recursive: true });
-    const safe = String(label).replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 60) || 'attachment';
-    const name = `${Date.now().toString(36)}-${safe}`;
+    const cleaned = String(label).replace(/[\\/:*?"<>|\s]+/g, '_') || 'attachment';
+    const dot = cleaned.lastIndexOf('.');
+    const ext = dot > 0 ? cleaned.slice(dot).slice(0, 10) : ''; // keep the extension when truncating
+    const stem = (dot > 0 ? cleaned.slice(0, dot) : cleaned).slice(0, 50);
+    const name = `${Date.now().toString(36)}-${stem}${ext}`;
     const abs = path.join(this.filesDir, name);
-    fs.writeFileSync(abs, content, 'utf8');
+    fs.writeFileSync(abs, content); // string or Buffer both fine
     return { absPath: abs, name, url: this.filesBaseUrl ? `${this.filesBaseUrl}/files/${encodeURIComponent(name)}` : null };
   }
 
@@ -132,7 +135,7 @@ export class GrokBotEngine {
   /** full turn: send text, wait for ALL bot reply segments of the new turn (agent tasks emit
    *  opener -> [silent work] -> attachment + summary; simple chat emits one segment).
    *  Completion = segment set stable for a quiet window (wider when the opener looks like "working on it"). */
-  async chat(text, { timeoutMs = 300000, pollMs = 3000, onEntry, images = [] } = {}) {
+  async chat(text, { timeoutMs = 300000, pollMs = 3000, onEntry, images = [], taskHint } = {}) {
     const turnOf = (id) => Number((/^t(\d+)[su]/.exec(id || '') || [])[1] || 0);
     const t0 = Date.now();
     const before = await this.listEntries(this.agentId).catch(() => []);
@@ -169,20 +172,27 @@ export class GrokBotEngine {
       const segs = [...seen.values()];
       const firstText = segs.find(s => s.message?.type === 'text')?.message?.content || '';
       const lastText = segs.filter(s => s.message?.type === 'text').at(-1)?.message?.content || '';
-      const working = /正在|稍等|让我|我来|开始|着手|creating|working|let me|on it/i.test(firstText);
+      const working = /正在|稍等|让我|我来|开始|着手|我.{0,4}(补全|出图|出一?张|重画)|creating|working|let me|on it/i.test(firstText);
       const hasAttachment = segs.some(s => s.message?.type === 'attachment');
-      // completion heuristics: attachment segments, closing phrases, and trailing questions all
-      // mark turn end — an agent that ends on a question to the user has finished its turn
-      const looksDone = hasAttachment || /做好了|完成了|已就绪|已生成|已保存|^done\b|ready\.?$|browser/i.test(lastText) || /[？?]\s*$/.test(lastText.trim());
+      // completion heuristics: attachment segments, refusals, closing phrases, and trailing
+      // questions all mark turn end — a refusal ends the turn even mid-task tier
+      const refusal = /我不能按|无法按|不能生成|无法生成|不能帮|不会生成|不能创建|无法创建|violate|policy|refuse|can't generate|won't generate/i.test(firstText + ' ' + lastText);
+      const looksDone = hasAttachment || refusal || /做好了|完成了|已就绪|已生成|已保存|^done\b|ready\.?$|browser/i.test(lastText) || /[？?]\s*$/.test(lastText.trim());
       // task prediction from the USER request (opener phrasing alone is unreliable: "先做一个" etc.
       // evade any keyword list): non-question + creation verbs/artifact nouns => long-wait tier
       const questionLike = /[？?]$/.test(String(text).trim());
-      const taskLike = !questionLike && /创建|生成|制作|写一|做一|画一|帮.{0,6}(做|写|画|生成)|html|文件|网页|动画|图片|视频|ppt|幻灯|表格|海报|修改|调整|改成|换成|更新|调大|调小|加上|去掉|删除|重命名/i.test(String(text));
+      const taskLike = !questionLike && /创建|生成|制作|写一|做一|画一|帮.{0,6}(做|写|画|生成)|html|文件|网页|动画|图片|视频|ppt|幻灯|表格|海报|画像|定妆|插画|绘制|补全|出图|修改|调整|改成|换成|更新|调大|调小|加上|去掉|删除|重命名/i.test(String(text));
+      // session task streak: a recent task turn means short acks ("对 补全即可") continue it
+      const isAck = String(text).trim().length <= 12 && !questionLike;
+      const sessionTask = isAck && Date.now() < (this.taskUntil || 0);
+      const tasky = taskHint || taskLike || working || sessionTask;
       const singleShort = segs.length === 1 && firstText.length < 500; // typical direct answer
-      const quietNeed = looksDone ? 4000 : ((taskLike || working) ? 60000 : (singleShort ? 2000 : 5000));
+      const quietNeed = looksDone ? 4000 : (tasky ? 60000 : (singleShort ? 2000 : 5000));
       if (Date.now() - lastChange >= quietNeed) break;
     }
     if (!seen.size) throw new Error(`timeout waiting for bot reply (workflow ${workflowId})`);
+    const hadAttachment = [...seen.values()].some(s => s.message?.type === 'attachment');
+    if (taskHint || taskLike || working || sessionTask || hadAttachment) this.taskUntil = Date.now() + 600000; // 10-min task streak
 
     const segIdx = (j) => Number((/^t\d+s(\d+)$/.exec(j.id || '') || [])[1] || 0);
     const parts = [];
@@ -251,7 +261,7 @@ export class GrokBotEngine {
   }
 
   /** read a bot-sandbox attachment fully (chunked); returns utf8 text or null when oversized */
-  async readAttachment(path, maxBytes = 204800) {
+  async readAttachment(path, maxBytes = 5242880) { // 5MB: generated images run ~400KB
     const call = async (offset, length) => {
       const crypto = await import('node:crypto');
       const r = await fetch(`${this.backend}/aiserver.v1.GrokBotService/ReadGrokBotAgentAttachmentChunk`, {
@@ -268,7 +278,7 @@ export class GrokBotEngine {
       const j = await call(off, Math.min(65536, total - off));
       chunks.push(Buffer.from(j.data || '', 'base64'));
     }
-    return Buffer.concat(chunks).toString('utf8');
+    return Buffer.concat(chunks); // raw bytes: binary files (png etc.) must stay intact
   }
 
   /** discover and persist the default chat agent (name 'Grok Bot', kind AGENT); Send/List f1 = legacyAgentId */

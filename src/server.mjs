@@ -42,7 +42,7 @@ const server = http.createServer(async (req, res) => {
       let data;
       try { data = fs.readFileSync(file); } catch { return json(res, 404, { error: { message: `no such file: ${name}` } }); }
       const ext = name.split('.').pop().toLowerCase();
-      const mime = { html: 'text/html; charset=utf-8', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', json: 'application/json', txt: 'text/plain; charset=utf-8', md: 'text/plain; charset=utf-8', csv: 'text/csv', pdf: 'application/pdf' }[ext] || 'application/octet-stream';
+      const mime = { html: 'text/html; charset=utf-8', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', ogg: 'audio/ogg', aac: 'audio/aac', flac: 'audio/flac', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', json: 'application/json', txt: 'text/plain; charset=utf-8', md: 'text/plain; charset=utf-8', csv: 'text/csv', pdf: 'application/pdf' }[ext] || 'application/octet-stream';
       res.writeHead(200, { 'content-type': mime, 'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(name)}` });
       return res.end(data);
     }
@@ -135,7 +135,17 @@ const server = http.createServer(async (req, res) => {
       // flatten conversation into a single prompt (bot session holds its own memory; this keeps OpenAI semantics)
       const prompt = clean.map(m => `${m.role === 'assistant' ? '[assistant]' : m.role === 'system' ? '[system]' : '[user]'} ${m.content}`).join('\n\n')
         + `\n\n[system] Reply to the last user message above directly.`;
-      const userMsg = [...clean].reverse().find(m => m.role === 'user')?.content || clean[clean.length - 1].content;
+      let userMsg = [...clean].reverse().find(m => m.role === 'user')?.content || clean[clean.length - 1].content;
+      // image-generation requests: bot shows results on its realtime canvas which never persists —
+      // instruct it to also deliver the file as an attachment (our attachment channel saves to files/)
+      if (/画一|画个|画张|生成.{0,8}(图|图片|图像)|draw |generate.{0,12}image/i.test(userMsg) && !/附件|文件发|保存成|save as/i.test(userMsg)) {
+        userMsg += '\n（画完后请把图片文件作为附件发给我）';
+      }
+      // task hint: any task wording anywhere in the conversation history (not just the latest turn —
+      // follow-ups like "对 补全即可" carry no task words but continue a task) beats the question check
+      const taskWords = /创建|生成|制作|写一|做一|画一|画个|画张|帮.{0,6}(做|写|画|生成)|html|文件|网页|动画|图片|视频|ppt|幻灯|表格|海报|画像|定妆|插画|绘制|补全|出图|出一?张|修改|调整|改成|换成|更新|调大|调小|加上|去掉|删除|重命名/i;
+      const taskHint = taskWords.test(userMsg) && !/[？?]\s*$/.test(userMsg.trim())
+        || clean.some(m => m.role === 'user' && taskWords.test(m.content));
 
       const id = `chatcmpl-${Date.now().toString(36)}`;
       const stream = body.stream === true;
@@ -166,10 +176,10 @@ const server = http.createServer(async (req, res) => {
         ? await pool.withScratch(async (acc, scratch) => {
             const saved = acc.engine.agentId;
             acc.engine.agentId = scratch.legacyAgentId;
-            try { return await acc.engine.chat(userMsg, { timeoutMs: 300000, pollMs: 3000, onEntry, images }); }
+            try { return await acc.engine.chat(userMsg, { timeoutMs: 300000, pollMs: 3000, onEntry, images, taskHint }); }
             finally { acc.engine.agentId = saved; }
           })
-        : await pool.withAccount(acc => acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images }));
+        : await pool.withAccount(acc => acc.engine.chat(stream ? userMsg : prompt, { timeoutMs: 300000, onEntry, images, taskHint }));
       stopHeartbeat();
 
       if (stream) {
