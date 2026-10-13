@@ -145,6 +145,7 @@ export class GrokBotEngine {
     for (let i = 0; i < 30; i++) {
       sent = await this.send(text, null, images || []);
       if (sent.dispatched || sent.refusal !== 'agent-unavailable') break;
+      if (i === 0 || i % 5 === 4) console.log(`[chat] send refused (agent-unavailable), retry ${i + 1}/30`);
       await new Promise(r => setTimeout(r, 3000));
     }
     const { workflowId } = sent;
@@ -156,6 +157,7 @@ export class GrokBotEngine {
     const seen = new Map(); // id -> segment
     let lastChange = Date.now();
     let lastGen = -1;
+    let taskyTurn = false; // task-tier verdict of the latest poll (block-scoped vars below can't cross the loop)
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, pollMs));
       const entries = await this.listEntries(this.agentId).catch(() => null);
@@ -172,7 +174,7 @@ export class GrokBotEngine {
       const segs = [...seen.values()];
       const firstText = segs.find(s => s.message?.type === 'text')?.message?.content || '';
       const lastText = segs.filter(s => s.message?.type === 'text').at(-1)?.message?.content || '';
-      const working = /正在|稍等|让我|我来|开始|着手|我.{0,4}(补全|出图|出一?张|重画)|creating|working|let me|on it/i.test(firstText);
+      const working = /正在|稍等|让我|我来|开始|着手|马上|这就|即将|先做|我.{0,4}(画|写|做|生成|创建|补全|出图|出一?张|重画)|creating|working|let me|on it/i.test(firstText);
       const hasAttachment = segs.some(s => s.message?.type === 'attachment');
       // completion heuristics: attachment segments, refusals, closing phrases, and trailing
       // questions all mark turn end — a refusal ends the turn even mid-task tier
@@ -181,18 +183,25 @@ export class GrokBotEngine {
       // task prediction from the USER request (opener phrasing alone is unreliable: "先做一个" etc.
       // evade any keyword list): non-question + creation verbs/artifact nouns => long-wait tier
       const questionLike = /[？?]$/.test(String(text).trim());
-      const taskLike = !questionLike && /创建|生成|制作|写一|做一|画一|帮.{0,6}(做|写|画|生成)|html|文件|网页|动画|图片|视频|ppt|幻灯|表格|海报|画像|定妆|插画|绘制|补全|出图|修改|调整|改成|换成|更新|调大|调小|加上|去掉|删除|重命名/i.test(String(text));
+      const abilityAsk = /(会|知道|了解|听说过).{0,6}(创建|生成|制作|画|写|做|文件|网页|动画|图片|视频|海报|画像|插画)/.test(String(text));
+      const taskLike = !questionLike && !abilityAsk && /创建|生成|制作|写一|做一|画一|帮.{0,6}(做|写|画|生成)|html|文件|网页|动画|图片|视频|ppt|幻灯|表格|海报|画像|定妆|插画|绘制|补全|出图|修改|调整|改成|换成|更新|调大|调小|加上|去掉|删除|重命名/i.test(String(text));
       // session task streak: a recent task turn means short acks ("对 补全即可") continue it
       const isAck = String(text).trim().length <= 12 && !questionLike;
       const sessionTask = isAck && Date.now() < (this.taskUntil || 0);
-      const tasky = taskHint || taskLike || working || sessionTask;
+      taskyTurn = !!(taskHint || taskLike || working || sessionTask);
       const singleShort = segs.length === 1 && firstText.length < 500; // typical direct answer
-      const quietNeed = looksDone ? 4000 : (tasky ? 60000 : (singleShort ? 2000 : 5000));
+      // bot-first arbitration: once segments arrived, the bot's own wording outranks the keyword
+      // tables. working (opener says "doing it") keeps the full 60s; keyword-only suspicion with a
+      // non-working opener drops to 25s — enough for real tasks to emit their next segment
+      // (observed max silent-work gap ~26s... covered by working-word matches), short enough that
+      // keyword false positives ("你会创建图片吗" answered instantly) don't stall for a minute.
+      const tier = working ? 60000 : ((taskHint || taskLike || sessionTask) ? 25000 : (singleShort ? 2000 : 5000));
+      const quietNeed = looksDone ? 4000 : tier;
       if (Date.now() - lastChange >= quietNeed) break;
     }
     if (!seen.size) throw new Error(`timeout waiting for bot reply (workflow ${workflowId})`);
     const hadAttachment = [...seen.values()].some(s => s.message?.type === 'attachment');
-    if (taskHint || taskLike || working || sessionTask || hadAttachment) this.taskUntil = Date.now() + 600000; // 10-min task streak
+    if (taskHint || taskyTurn || hadAttachment) this.taskUntil = Date.now() + 600000; // 10-min task streak
 
     const segIdx = (j) => Number((/^t\d+s(\d+)$/.exec(j.id || '') || [])[1] || 0);
     const parts = [];

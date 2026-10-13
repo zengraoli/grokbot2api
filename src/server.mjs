@@ -144,8 +144,9 @@ const server = http.createServer(async (req, res) => {
       // task hint: any task wording anywhere in the conversation history (not just the latest turn —
       // follow-ups like "对 补全即可" carry no task words but continue a task) beats the question check
       const taskWords = /创建|生成|制作|写一|做一|画一|画个|画张|帮.{0,6}(做|写|画|生成)|html|文件|网页|动画|图片|视频|ppt|幻灯|表格|海报|画像|定妆|插画|绘制|补全|出图|出一?张|修改|调整|改成|换成|更新|调大|调小|加上|去掉|删除|重命名/i;
-      const taskHint = taskWords.test(userMsg) && !/[？?]\s*$/.test(userMsg.trim())
-        || clean.some(m => m.role === 'user' && taskWords.test(m.content));
+      const abilityAsk = /(会|知道|了解|听说过).{0,6}(创建|生成|制作|画|写|做|文件|网页|动画|图片|视频|海报|画像|插画)/.test(userMsg); // "你会创建图片吗" asks ability, not a task
+      const taskHint = (taskWords.test(userMsg) && !abilityAsk && !/[？?]\s*$/.test(userMsg.trim()))
+        || clean.some(m => m.role === 'user' && taskWords.test(m.content) && !/(会|知道|了解|听说过).{0,6}(创建|生成|制作|画|写|做)/.test(m.content));
 
       const id = `chatcmpl-${Date.now().toString(36)}`;
       const stream = body.stream === true;
