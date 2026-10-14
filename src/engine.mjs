@@ -135,6 +135,78 @@ export class GrokBotEngine {
   /** full turn: send text, wait for ALL bot reply segments of the new turn (agent tasks emit
    *  opener -> [silent work] -> attachment + summary; simple chat emits one segment).
    *  Completion = segment set stable for a quiet window (wider when the opener looks like "working on it"). */
+  /** open a live WatchGrokBotTranscripts stream (connect streaming, gzip frames).
+   *  Returns { next(ms), close() }; next resolves with {type:'entries'|'live'|'turn_failed'|'end', ...}
+   *  or null on timeout. Official-client request shape: no cursors, includeUnlistedAgents, 2MB inline. */
+  openWatch() {
+    const cryptoMod = crypto;
+    const ctrl = new AbortController();
+    const req = Buffer.concat([num(2, 1), num(3, 2097152)]);
+    const head = Buffer.alloc(5); head.writeUInt32BE(req.length, 1); // connect frame: 1B flags + 4B length BE
+    const queue = []; let waiter = null; let ended = false; let raw = Buffer.alloc(0);
+    const push = (ev) => { if (waiter) { const w = waiter; waiter = null; w(ev); } else queue.push(ev); };
+    (async () => {
+      try {
+        const res = await fetch(`${this.backend}/aiserver.v1.GrokBotService/WatchGrokBotTranscripts`, {
+          method: 'POST', signal: ctrl.signal,
+          headers: { ...this.headers(), 'content-type': 'application/connect+proto', 'accept-encoding': 'identity', 'connect-accept-encoding': 'gzip' },
+          body: Buffer.concat([head, req]),
+        });
+        if (res.status !== 200) throw new Error(`watch -> ${res.status}`);
+        const reader = res.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          raw = Buffer.concat([raw, Buffer.from(value)]);
+          while (raw.length >= 5) {
+            const flags = raw[0]; const len = raw.readUInt32BE(1);
+            if (raw.length < 5 + len) break;
+            let payload = raw.slice(5, 5 + len); raw = raw.slice(5 + len);
+            if (flags & 0x01) { try { payload = zlib.gunzipSync(payload); } catch {} }
+            if (flags & 0x02) { let msg = null; try { msg = JSON.parse(payload.toString('utf8') || '{}').error?.message; } catch {} push({ type: 'end', error: msg }); return; }
+            for (const fr of decode(payload)) {
+              if (fr.f === 2 && fr.b) { // WatchRows: agentId + entries[]
+                const inner = decode(fr.b);
+                const rowsAgent = inner.find(x => x.f === 1)?.s;
+                if (rowsAgent && rowsAgent !== this.agentId) continue;
+                const entries = inner.filter(x => x.f === 3 && x.b).map(x => {
+                  const e = decode(x.b);
+                  const kind = e.find(y => y.f === 2)?.s || '';
+                  let body = null;
+                  const bodyBytes = e.find(y => y.f === 3)?.b;
+                  if (bodyBytes) { try { body = JSON.parse(bodyBytes.toString('utf8')); } catch {} }
+                  if (body && body.kind) return body;
+                  if (body && body.message) return { kind, id: e.find(y => y.f === 6)?.s, message: body.message, timestampMs: body.timestampMs || Date.now() };
+                  return null;
+                }).filter(Boolean);
+                if (entries.length) push({ type: 'entries', entries });
+              } else if (fr.f === 6 && fr.b) { // agent_state.live: authoritative running/composing flags
+                for (const li of decode(fr.b).filter(x => x.f === 1 && x.b)) {
+                  const ls = decode(li.b);
+                  if (ls.find(y => y.f === 1)?.s === this.agentId) {
+                    push({ type: 'live', running: ls.find(y => y.f === 2)?.v === '1', composing: ls.find(y => y.f === 3)?.v === '1' });
+                  }
+                }
+              } else if (fr.f === 9 && fr.b) { // turn_failed
+                const inner = decode(fr.b);
+                push({ type: 'turn_failed', summary: inner.find(y => y.f === 5)?.s || '' });
+              }
+            }
+          }
+        }
+        push({ type: 'end', error: null });
+      } catch (e) { push({ type: 'end', error: e.message }); }
+    })();
+    return {
+      next: (timeoutMs) => new Promise((resolve) => {
+        if (queue.length) return resolve(queue.shift());
+        if (ended) return resolve({ type: 'end', error: null });
+        const timer = setTimeout(() => { waiter = null; resolve(null); }, timeoutMs);
+        waiter = (ev) => { clearTimeout(timer); if (ev.type === 'end') ended = true; resolve(ev); };
+      }),
+      close: () => { try { ctrl.abort(); } catch {} },
+    };
+  }
+
   async chat(text, { timeoutMs = 300000, pollMs = 3000, onEntry, images = [], taskHint } = {}) {
     const turnOf = (id) => Number((/^t(\d+)[su]/.exec(id || '') || [])[1] || 0);
     const t0 = Date.now();
@@ -158,9 +230,21 @@ export class GrokBotEngine {
     let lastChange = Date.now();
     let lastGen = -1;
     let taskyTurn = false; // task-tier verdict of the latest poll (block-scoped vars below can't cross the loop)
+    let liveIdle = null; // authoritative running state from Watch agent_state frames
+    const watch = this.openWatch(); // sync factory; internal failures surface as an 'end' event and we fall back to polling
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, pollMs));
-      const entries = await this.listEntries(this.agentId).catch(() => null);
+      let entries = [];
+      if (watch) {
+        const ev = await watch.next(3000);
+        if (ev === null) entries = []; // tick: still run silence judging below
+        else if (ev.type === 'entries') entries = ev.entries;
+        else if (ev.type === 'live') { liveIdle = (ev.running === false && ev.composing === false); } // state flag only — never resets the silence clock
+        else if (ev.type === 'turn_failed') { watch.close(); throw new Error(`bot turn failed: ${ev.summary || 'unknown'}`); }
+        else if (ev.type === 'end') { console.log('[watch] stream ended:', ev.error || 'clean'); watch.close(); entries = await this.listEntries(this.agentId).catch(() => null); }
+      } else {
+        await new Promise(r => setTimeout(r, pollMs));
+        entries = await this.listEntries(this.agentId).catch(() => null);
+      }
       if (!entries) continue;
       if (entries.generation !== undefined && entries.generation !== lastGen) { lastGen = entries.generation; lastChange = Date.now(); }
       for (const j of entries) {
@@ -196,9 +280,12 @@ export class GrokBotEngine {
       // (observed max silent-work gap ~26s... covered by working-word matches), short enough that
       // keyword false positives ("你会创建图片吗" answered instantly) don't stall for a minute.
       const tier = working ? 60000 : ((taskHint || taskLike || sessionTask) ? 25000 : (singleShort ? 2000 : 5000));
-      const quietNeed = looksDone ? 4000 : tier;
+      // live agent state is the authoritative idle signal, but bots go briefly idle between the
+      // opener and tool calls — only trust it when the opener didn't say "working on it"
+      const quietNeed = looksDone ? 4000 : (liveIdle === true && !working ? 6000 : tier);
       if (Date.now() - lastChange >= quietNeed) break;
     }
+    watch?.close();
     if (!seen.size) throw new Error(`timeout waiting for bot reply (workflow ${workflowId})`);
     const hadAttachment = [...seen.values()].some(s => s.message?.type === 'attachment');
     if (taskHint || taskyTurn || hadAttachment) this.taskUntil = Date.now() + 600000; // 10-min task streak
